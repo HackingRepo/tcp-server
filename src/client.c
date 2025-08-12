@@ -23,6 +23,7 @@ static struct addrinfo *server_info = NULL;
 static int socket_fd = -1;
 
 int main(void) {
+    signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crashes on broken pipes
     atexit(cleanup);
     signal(SIGINT, handle_sigint);
 
