@@ -1,4 +1,3 @@
-// feature test macro for getline() from man pages
 #define _POSIX_C_SOURCE 200809L
 
 #include <netdb.h>
@@ -8,96 +7,133 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>  // Added for close()
 
 #include "./shared.h"
 
-void cleanup(void);
-void handle_sigint(int sig);
+#define MAX_MSG_SIZE 1024
+#define MIN_MSG_SIZE 1
 
-struct addrinfo *server_info;
+static void cleanup(void);
+static void handle_sigint(int sig);
+static bool send_message(int socket_fd, const char *msg, size_t len);
+static bool receive_message(int socket_fd, char *buffer, size_t buffer_size);
+
+static struct addrinfo *server_info = NULL;
+static int socket_fd = -1;
 
 int main(void) {
-  atexit(cleanup);
-  signal(SIGINT, handle_sigint);
+    atexit(cleanup);
+    signal(SIGINT, handle_sigint);
 
-  // to store the return value of various function calls for error checking
-  int rv;
+    int rv;
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
 
-  struct addrinfo hints = {0};     // make sure the struct is empty
-  hints.ai_family = AF_UNSPEC;     // don't care whether it's IPv4 or IPv6
-  hints.ai_socktype = SOCK_STREAM; // TCP stream sockets
-  hints.ai_flags = AI_PASSIVE;     // fill in my IP for me
-
-  // NULL to assign the address of my local host to socket structures
-  // because the server is also running locally
-  rv = getaddrinfo(NULL, PORT, &hints, &server_info);
-  if (rv != 0) {
-    fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(rv));
-    return EXIT_FAILURE;
-  }
-
-  // create a socket
-  int socket_fd = socket(server_info->ai_family, server_info->ai_socktype,
-                         server_info->ai_protocol);
-  if (socket_fd == -1) {
-    perror("socket()");
-    return EXIT_FAILURE;
-  }
-
-  // connect to the server socket as the address specified in server_info
-  rv = connect(socket_fd, server_info->ai_addr, server_info->ai_addrlen);
-  if (rv == -1) {
-    perror("connect()");
-    return EXIT_FAILURE;
-  }
-
-  // free server_info because we don't need it anymore
-  freeaddrinfo(server_info);
-  server_info = NULL; // to avoid dangling pointer (& double free at cleanup())
-
-  char received_msg[1024];
-  char *line = NULL;
-  size_t line_cap = 0;
-  ssize_t line_len;
-
-  printf("> ");
-  while ((line_len = getline(&line, &line_cap, stdin)) > 0) {
-    line[line_len - 1] = '\0'; // to ignore the newline character at the end
-
-    // send the message to the server
-    int bytes_sent = send(socket_fd, line, line_len, 0);
-    if (bytes_sent == -1) {
-      perror("send()");
-      return EXIT_FAILURE;
+    rv = getaddrinfo(NULL, PORT, &hints, &server_info);
+    if (rv != 0) {
+        fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(rv));
+        return EXIT_FAILURE;
     }
 
-    // receive the message from the server
-    int bytes_read = recv(socket_fd, received_msg, sizeof received_msg, 0);
-    if (bytes_read == -1) {
-      perror("recv()");
-      return EXIT_FAILURE;
-    } else if (bytes_read == 0) {
-      fputs("recv(): server closed the connection\n", stderr);
-      return EXIT_FAILURE;
+    socket_fd = socket(server_info->ai_family, server_info->ai_socktype,
+                      server_info->ai_protocol);
+    if (socket_fd == -1) {
+        perror("socket()");
+        return EXIT_FAILURE;
     }
 
-    received_msg[bytes_read] = '\0'; // null-terminate the received message
+    rv = connect(socket_fd, server_info->ai_addr, server_info->ai_addrlen);
+    if (rv == -1) {
+        perror("connect()");
+        return EXIT_FAILURE;
+    }
 
-    printf("server says: %s\n", received_msg);
-    printf("> ");
-  }
-
-  return EXIT_SUCCESS;
-}
-
-void cleanup(void) {
-  // free the addrinfo linked list
-  if (server_info != NULL) {
+    // Free server_info immediately after use
     freeaddrinfo(server_info);
-  }
+    server_info = NULL;
+
+    char received_msg[MAX_MSG_SIZE];
+    char *line = NULL;
+    size_t line_cap = 0;
+    ssize_t line_len;
+
+    printf("> ");
+    while ((line_len = getline(&line, &line_cap, stdin)) > 0) {
+        // Remove newline
+        if (line_len > 0 && line[line_len - 1] == '\n') {
+            line[--line_len] = '\0';
+        }
+
+        // Validate message size
+        if (line_len < MIN_MSG_SIZE || line_len >= MAX_MSG_SIZE) {
+            fprintf(stderr, "Message length must be between %d and %d bytes\n",
+                    MIN_MSG_SIZE, MAX_MSG_SIZE - 1);
+            printf("> ");
+            continue;
+        }
+
+        // Send message
+        if (!send_message(socket_fd, line, line_len)) {
+            free(line);
+            return EXIT_FAILURE;
+        }
+
+        // Receive response
+        if (!receive_message(socket_fd, received_msg, sizeof(received_msg))) {
+            free(line);
+            return EXIT_FAILURE;
+        }
+
+        printf("server says: %s\n> ", received_msg);
+    }
+
+    free(line);
+    return EXIT_SUCCESS;
 }
 
-void handle_sigint(int sig) {
-  // call exit manually because atexit() registered the cleanup function
-  exit(EXIT_SUCCESS);
+static bool send_message(int socket_fd, const char *msg, size_t len) {
+    size_t total_sent = 0;
+    while (total_sent < len) {
+        ssize_t sent = send(socket_fd, msg + total_sent, len - total_sent, 0);
+        if (sent == -1) {
+            perror("send()");
+            return false;
+        }
+        total_sent += sent;
+    }
+    return true;
+}
+
+static bool receive_message(int socket_fd, char *buffer, size_t buffer_size) {
+    memset(buffer, 0, buffer_size);
+    ssize_t bytes_read = recv(socket_fd, buffer, buffer_size - 1, 0);
+    
+    if (bytes_read == -1) {
+        perror("recv()");
+        return false;
+    }
+    if (bytes_read == 0) {
+        fprintf(stderr, "recv(): server closed the connection\n");
+        return false;
+    }
+
+    buffer[bytes_read] = '\0';
+    return true;
+}
+
+static void cleanup(void) {
+    if (socket_fd != -1) {
+        close(socket_fd);
+    }
+    if (server_info != NULL) {
+        freeaddrinfo(server_info);
+    }
+}
+
+static void handle_sigint(int sig) {
+    (void)sig;  // Unused parameter
+    exit(EXIT_SUCCESS);
 }
